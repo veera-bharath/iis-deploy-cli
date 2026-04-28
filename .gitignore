@@ -1,0 +1,7 @@
+logs/
+/configs/
+deploy-history.json
+deploy.lock
+rollback.lock
+tests/backups/
+*.stackdump

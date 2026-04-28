@@ -1,0 +1,13 @@
+﻿{
+  "BackupRoot": "D:\\Projects\\PublishIISCli\\tests\\backups",
+  "PublishZipPath": "D:\\Projects\\PublishIISCli\\tests\\publish1.zip",
+  "Sites": [
+    {
+      "Name": "TestApp",
+      "Path": "D:\\Projects\\PublishIISCli\\tests\\TestApp",
+      "AppPool": "TestAppPool",
+      "ExcludedFiles": [],
+      "HealthUrl": "http://localhost:8022/"
+    }
+  ]
+}
