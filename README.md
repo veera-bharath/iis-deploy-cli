@@ -167,6 +167,8 @@ PowerShell-native forms are also accepted: `-DryRun`, `-SkipBackup`, `-NoRestart
 
 ## Project Structure
 
+### Repository
+
 ```
 install.bat                        # Runs the installer
 scripts/
@@ -182,9 +184,23 @@ tests/
     deploy-config-testapp.json.example   # Example config for reference
   publish1.zip                     # Test publish package v1
   publish2.zip                     # Test publish package v2
-configs/                           # Per-project JSON configs (git-ignored)
-logs/                              # Transcript logs per deploy/rollback (git-ignored)
-deploy-history.json                # Append-only deploy log (git-ignored)
+```
+
+### After install (default `C:\Tools\Deploy`)
+
+The installer copies the three `.ps1` scripts into a flat directory, generates `.bat` wrappers, and adds the directory to system PATH. Configs and logs are created here as you use the tool.
+
+```
+C:\Tools\Deploy\
+  deploy.ps1                       # Deploy logic
+  deploy.bat                       # Run deploy from any prompt
+  rollback-deploy.ps1              # Rollback logic
+  rollback-deploy.bat              # Run rollback from any prompt
+  deploy-config.ps1                # Config editor
+  deploy-config.bat                # Run config editor from any prompt
+  configs/                         # Per-project JSON configs
+  logs/                            # Transcript logs per deploy/rollback
+  deploy-history.json              # Append-only deploy log
 ```
 
 ## License
