@@ -177,10 +177,11 @@ scripts/
   deploy.cmd                       # Batch wrapper for deploy.ps1
   rollback-deploy.cmd              # Batch wrapper for rollback-deploy.ps1
   deploy-config.bat                # Batch wrapper for deploy-config.ps1
-  tests/
-    deploy.Tests.ps1               # Pester v5 tests for deploy.ps1
-    rollback-deploy.Tests.ps1      # Pester v5 tests for rollback-deploy.ps1
-    Run-Tests.ps1                  # Convenience test runner
+tests/
+  configs/
+    deploy-config-testapp.json.example   # Example config for reference
+  publish1.zip                     # Test publish package v1
+  publish2.zip                     # Test publish package v2
 configs/                           # Per-project JSON configs (git-ignored)
 logs/                              # Transcript logs per deploy/rollback (git-ignored)
 deploy-history.json                # Append-only deploy log (git-ignored)
