@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 
 $RootDir    = if ((Split-Path $PSScriptRoot -Leaf) -eq 'scripts') { Split-Path $PSScriptRoot -Parent } else { $PSScriptRoot }
 $ConfigsDir = Join-Path $RootDir "configs"
@@ -101,6 +101,11 @@ function Ensure-ConfigsDir {
 # Site input
 # ==============================================================================
 
+function _IsAdmin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    return ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
 function Read-Site {
     param([int]$Index, [string]$Total, $Existing = $null)
 
@@ -108,39 +113,160 @@ function Read-Site {
     Write-Host ("  ---- Site {0} of {1} --------------------------------" -f $Index, $Total) -ForegroundColor DarkCyan
     Write-Host ""
 
-    $nameDef = if ($Existing) { $Existing.Name    } else { "" }
-    $pathDef = if ($Existing) { $Existing.Path    } else { "" }
-    $poolDef = if ($Existing) { $Existing.AppPool } else { "" }
+    # ---- seed defaults from existing config ---------------------------------
 
+    $zipNameDef     = if ($Existing) { $Existing.Name    } else { "" }
+    $pathDef        = if ($Existing) { $Existing.Path    } else { "" }
+    $poolDef        = if ($Existing) { $Existing.AppPool } else { "" }
+    $iisSiteNameDef = if ($Existing -and $Existing.PSObject.Properties['IISSiteName'] -and $Existing.IISSiteName) { $Existing.IISSiteName } else { $zipNameDef }
+    $healthDef      = if ($Existing -and $Existing.PSObject.Properties['HealthUrl']   -and $Existing.HealthUrl)   { $Existing.HealthUrl }   else { "" }
     $excDef = ""
     if ($Existing -and $Existing.PSObject.Properties['ExcludedFiles'] -and
         $Existing.ExcludedFiles -and $Existing.ExcludedFiles.Count -gt 0) {
         $excDef = $Existing.ExcludedFiles -join ","
     }
 
-    $healthDef = ""
-    if ($Existing -and $Existing.PSObject.Properties['HealthUrl'] -and $Existing.HealthUrl) {
-        $healthDef = $Existing.HealthUrl
+    # ---- 1. IIS identity - loop until check passes or user decides ----------
+
+    $webAdmin = $false
+    try { Import-Module WebAdministration -ErrorAction Stop; $webAdmin = $true } catch {}
+
+    $iisSiteName = $iisSiteNameDef
+    $path        = $pathDef
+    $pool        = $poolDef
+    $done        = $false
+
+    while (-not $done) {
+
+        $iisSiteName = Prompt-Value "IIS site name"  $iisSiteNameDef  "name shown in IIS Manager"                             -Required
+        $path        = Prompt-Value "Physical path"  $pathDef         "IIS site physical path  e.g. C:\inetpub\wwwroot\MyApp" -Required
+        $pool        = Prompt-Value "App pool name"  $poolDef         ""                                                      -Required
+
+        # update defaults so re-entry shows what was just typed
+        $iisSiteNameDef = $iisSiteName; $pathDef = $path; $poolDef = $pool
+
+        if (-not $webAdmin) {
+            Write-Host ""
+            Write-Host "  [i] WebAdministration not available - IIS check skipped." -ForegroundColor DarkGray
+            Write-Host "      Ensure the app pool and site exist before running deploy." -ForegroundColor DarkGray
+            $done = $true
+            break
+        }
+
+        $poolExists   = Test-Path "IIS:\AppPools\$pool"
+        $siteExists   = $null -ne (Get-Website -Name $iisSiteName -ErrorAction SilentlyContinue)
+        $folderExists = Test-Path $path
+
+        if ($poolExists -and $siteExists -and $folderExists) {
+            Write-Ok "Folder found   : $path"
+            Write-Ok "App pool found : $pool"
+            Write-Ok "IIS site found : $iisSiteName"
+            $done = $true
+            break
+        }
+
+        # report what is missing
+        Write-Host ""
+        if (-not $folderExists) { Write-Fail "Folder not found   : $path" }
+        if (-not $poolExists)   { Write-Fail "App pool not found : $pool" }
+        if (-not $siteExists)   { Write-Fail "IIS site not found : $iisSiteName" }
+        Write-Host ""
+        Write-Host "   1.  Re-enter details" -ForegroundColor Cyan
+        Write-Host "   2.  Create them now" -ForegroundColor Cyan
+        Write-Host "   3.  I'll set them up manually" -ForegroundColor Cyan
+        Write-Host ""
+
+        $opt = ""
+        while ($opt -notin @("1","2","3")) {
+            $raw = (Read-Host "  Choice [2]").Trim()
+            $opt = if ($raw -eq "") { "2" } else { $raw }
+        }
+
+        if ($opt -eq "1") { Write-Host ""; continue }
+
+        if ($opt -eq "3") {
+            Write-Host ""
+            Write-Hint "Create the folder, app pool, and IIS site manually in IIS Manager."
+            Write-Hint "Then run 'deploy --setup-config' again if you need to update settings."
+            $done = $true
+            break
+        }
+
+        # Option 2 - create now (runtime/port/hostname used only for creation, not saved)
+        if (-not (_IsAdmin)) {
+            Write-Host ""
+            Write-Fail "Creating IIS resources requires an elevated (Administrator) session."
+            Write-Hint "Re-run 'deploy --setup-config' from an elevated prompt and choose option 2,"
+            Write-Hint "or create the folder, app pool, and site manually in IIS Manager."
+            $done = $true
+            break
+        }
+
+        Write-Host ""
+        Write-Host "  ---- IIS Binding (used for creation only, not saved to config) --------" -ForegroundColor DarkCyan
+        Write-Host ""
+
+        $rtStr   = Prompt-Value "App pool runtime"  "NoCLR"  "NoCLR for .NET Core / 5+   or   v4.0 for classic ASP.NET"
+        $portStr = Prompt-Value "Site port"         "80"     "HTTP binding port  e.g. 80, 8080, 8022"
+        $hostStr = Prompt-Value "Site hostname"     ""       "optional host header  e.g. myapp.local  (blank = any)"
+
+        $createRuntime    = if ($rtStr   -ne '') { $rtStr } else { 'NoCLR' }
+        $createPort       = if ($portStr -match '^\d+$') { [int]$portStr } else { 80 }
+        $createHostname   = $hostStr
+        $createClrVersion = if ($createRuntime -eq 'NoCLR') { '' } else { $createRuntime }
+
+        Write-Host ""
+
+        if (-not $folderExists) {
+            try   { New-Item $path -ItemType Directory -Force | Out-Null; Write-Ok "Created folder   : $path" }
+            catch { Write-Fail "Could not create folder : $($_.Exception.Message)" }
+        }
+
+        if (-not $poolExists) {
+            try {
+                New-WebAppPool $pool | Out-Null
+                Set-ItemProperty "IIS:\AppPools\$pool" managedRuntimeVersion $createClrVersion
+                Write-Ok "Created app pool : $pool  (runtime: $createRuntime)"
+            } catch { Write-Fail "Could not create app pool : $($_.Exception.Message)" }
+        }
+
+        if (-not $siteExists) {
+            try {
+                New-Website -Name $iisSiteName -PhysicalPath $path -ApplicationPool $pool -Port $createPort -HostHeader $createHostname | Out-Null
+                Write-Ok "Created IIS site : '$iisSiteName'  binding: *:${createPort}:${createHostname}"
+            } catch { Write-Fail "Could not create IIS site : $($_.Exception.Message)" }
+        }
+
+        $done = $true
     }
 
-    $name   = Prompt-Value "Site name"         $nameDef  ""                                                          -Required
-    $path   = Prompt-Value "IIS physical path" $pathDef  "e.g. C:\inetpub\wwwroot\MyApp"                            -Required
-    $pool   = Prompt-Value "App pool name"     $poolDef  ""                                                          -Required
-    $excRaw = Prompt-Value "Excluded files"    $excDef   "comma-separated patterns  e.g. appsettings*.json,web.config"
-    $health = Prompt-Value "Health check URL"  $healthDef "optional  e.g. http://localhost/api/health"
+    # ---- 2. Deploy settings -------------------------------------------------
+
+    Write-Host ""
+    Write-Host "  ---- Deploy Settings --------" -ForegroundColor DarkCyan
+    Write-Host ""
+
+    # Default zip folder name to IIS site name when creating a new site
+    if ($zipNameDef -eq '') { $zipNameDef = $iisSiteName }
+
+    $zipName = Prompt-Value "ZIP folder name"  $zipNameDef  "top-level folder inside the publish ZIP that maps to this site"  -Required
+    $excRaw  = Prompt-Value "Excluded files"   $excDef      "comma-separated glob patterns  e.g. appsettings*.json,web.config"
+    $health  = Prompt-Value "Health check URL" $healthDef   "GET-probed after each deploy  e.g. http://localhost:8080/api/health"
 
     $excluded = @()
     if ($excRaw -ne "") {
         $excluded = @($excRaw.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
     }
 
+    # ---- build site object (IIS creation details are not persisted) ---------
+
     $site = [ordered]@{
-        Name          = $name
-        Path          = $path
-        AppPool       = $pool
-        ExcludedFiles = $excluded
+        Name    = $zipName
+        Path    = $path
+        AppPool = $pool
     }
-    if ($health -ne "") { $site['HealthUrl'] = $health }
+    if ($excluded.Count -gt 0) { $site['ExcludedFiles'] = $excluded }
+    if ($health -ne "")        { $site['HealthUrl']     = $health }
 
     return [PSCustomObject]$site
 }
@@ -338,3 +464,4 @@ switch ($action) {
     "add"    { Add-Project $projects }
     "update" { Update-Project $projects }
 }
+

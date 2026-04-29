@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 
 param(
     [Parameter(Mandatory=$true)]
@@ -187,6 +187,35 @@ try {
     LogOk "Restore root: $restoreRoot"
 
     # ------------------------------------------------
+    # EMPTY BACKUP CHECK
+    # ------------------------------------------------
+
+    $emptySites = @()
+    foreach ($s in $Sites) {
+        $src = Join-Path $restoreRoot $s.Name
+        if (Test-Path $src) {
+            $fileCount = (Get-ChildItem $src -Recurse -File -ErrorAction SilentlyContinue).Count
+            if ($fileCount -eq 0) {
+                $emptySites += $s.Name
+            }
+        }
+    }
+
+    if ($emptySites.Count -gt 0) {
+        Write-Host ""
+        LogWarn "The following site(s) in this backup contain NO files:"
+        foreach ($name in $emptySites) { Write-Host "    $name" }
+        LogWarn "This backup was likely taken before any files were ever deployed to that site."
+        LogWarn "Proceeding will EMPTY the live site(s) listed above."
+        Write-Host ""
+        if (-not $Force) {
+            $confirm2 = Read-Host "Type 'YES' to confirm you want to restore an empty backup"
+            if ($confirm2 -ne 'YES') { throw "Rollback cancelled - empty backup not confirmed." }
+            Write-Host ""
+        }
+    }
+
+    # ------------------------------------------------
     # ROLLBACK
     # ------------------------------------------------
 
@@ -366,3 +395,4 @@ finally {
     if ($lockAcquired -and (Test-Path $LockFile)) { Remove-Item $LockFile -Force }
     try { Stop-Transcript } catch {}
 }
+

@@ -10,6 +10,8 @@
 #   deploy <project> --rollback --backup <name>
 #   deploy <project> --rollback --force    skip confirmation prompt
 #   deploy <project> --rollback --list-backups
+#   deploy <project> --validate-config     check config, paths, zip, IIS - no deploy
+#   deploy [project] --status              show pool state, last deploy, backup count
 #   deploy --list-projects                 list configured projects
 #   deploy --setup-config                  add or edit a project config
 #   deploy --help                          show usage
@@ -49,6 +51,8 @@ function Show-DeployHelp {
     deploy <project> --rollback --backup <name> rollback to a specific backup
     deploy <project> --rollback --force         skip confirm prompt
     deploy <project> --rollback --list-backups  list backups for a project
+    deploy <project> --validate-config          check config, paths, zip and IIS without deploying
+    deploy [project] --status                   show pool state, last deploy and backup info
     deploy --list-projects                      list configured projects
     deploy --setup-config                       add or edit a project config
     deploy --help                               this help
@@ -81,8 +85,11 @@ while ($ai -lt $rawArgs.Count) {
             'force'         { $Force       = $true }
             'no-restart'    { $NoRestart   = $true }
             'norestart'     { $NoRestart   = $true }
-            'no-auto-rollback' { $NoAutoRollback = $true }
-            'noautorollback'   { $NoAutoRollback = $true }
+            'no-auto-rollback'  { $NoAutoRollback  = $true }
+            'noautorollback'   { $NoAutoRollback  = $true }
+            'validate-config'  { $Action = 'validate-config' }
+            'validateconfig'   { $Action = 'validate-config' }
+            'status'           { $Action = 'status' }
             'project'       { $ai++; $ProjectName  = [string]$rawArgs[$ai] }
             'p'             { $ai++; $ProjectName  = [string]$rawArgs[$ai] }
             'backup'        { $ai++; $BackupName   = [string]$rawArgs[$ai] }
@@ -178,6 +185,204 @@ if ($Action -eq 'rollback') {
     if ($ListBackups) { $rbParams['ListBackups']  = $true }
 
     & $rbScript @rbParams
+    exit 0
+}
+
+
+# ---- subcommand: validate-config -------------------------------------------
+
+if ($Action -eq 'validate-config') {
+    if (-not $ProjectName) { throw "Project name required. Usage: deploy <project> --validate-config" }
+
+    $configsDir = Join-Path $RootDir 'configs'
+    $configFile = Join-Path $configsDir "deploy-config-$ProjectName.json"
+
+    $allPassed = $true
+
+    function VCheck([string]$label, [bool]$ok, [string]$detail = '') {
+        if ($ok) {
+            Write-Host ("  [ OK ] {0}" -f $label) -ForegroundColor Green
+        } else {
+            Write-Host ("  [FAIL] {0}{1}" -f $label, $(if ($detail) { " -- $detail" } else { '' })) -ForegroundColor Red
+            $script:allPassed = $false
+        }
+    }
+    function VInfo([string]$label, [string]$value) {
+        Write-Host ("  [ -- ] {0,-28} {1}" -f $label, $value) -ForegroundColor DarkGray
+    }
+
+    Write-Host ""
+    Write-Host "  Validating: $ProjectName" -ForegroundColor Cyan
+    Write-Host ("  " + ("-" * 58)) -ForegroundColor DarkGray
+    Write-Host ""
+
+    # Config file
+    VCheck "Config file exists" (Test-Path $configFile)
+    if (-not (Test-Path $configFile)) {
+        Write-Host ""
+        Write-Host "  Cannot continue - config file not found: $configFile" -ForegroundColor Red
+        Write-Host ""
+        exit 1
+    }
+
+    $cfg = $null
+    try   { $cfg = Get-Content $configFile -Raw | ConvertFrom-Json; VCheck "Config JSON valid" $true }
+    catch { VCheck "Config JSON valid" $false $_.Exception.Message; exit 1 }
+
+    VCheck "BackupRoot defined"     (-not [string]::IsNullOrWhiteSpace($cfg.BackupRoot))
+    VCheck "PublishZipPath defined" (-not [string]::IsNullOrWhiteSpace($cfg.PublishZipPath))
+    VCheck "Sites defined"          ($cfg.Sites -and @($cfg.Sites).Count -gt 0)
+
+    if ($cfg.BackupRoot) {
+        VCheck "BackupRoot path exists" (Test-Path $cfg.BackupRoot) $cfg.BackupRoot
+    }
+
+    # Publish source
+    if ($cfg.PublishZipPath) {
+        if (Test-Path $cfg.PublishZipPath) {
+            VCheck "Publish ZIP exists" $true
+            try {
+                Add-Type -AssemblyName System.IO.Compression.FileSystem
+                $zip = [System.IO.Compression.ZipFile]::OpenRead($cfg.PublishZipPath)
+                try {
+                    $zipFolders = $zip.Entries |
+                        ForEach-Object { ($_.FullName -replace '\\','/').Split('/')[0] } |
+                        Where-Object   { $_ -ne '' } |
+                        Sort-Object -Unique
+                    foreach ($s in @($cfg.Sites)) {
+                        VCheck "ZIP contains site folder '$($s.Name)'" ($zipFolders -contains $s.Name)
+                    }
+                } finally { $zip.Dispose() }
+            } catch {
+                VCheck "ZIP readable" $false $_.Exception.Message
+            }
+        } else {
+            $folderPath = [System.IO.Path]::ChangeExtension($cfg.PublishZipPath, $null).TrimEnd('.')
+            if (Test-Path $folderPath -PathType Container) {
+                VCheck "Publish source exists (pre-extracted folder)" $true
+                foreach ($s in @($cfg.Sites)) {
+                    VCheck "Folder contains site folder '$($s.Name)'" (Test-Path (Join-Path $folderPath $s.Name))
+                }
+            } else {
+                VCheck "Publish source exists" $false "ZIP not found and no extracted folder at '$folderPath'"
+            }
+        }
+    }
+
+    # IIS checks per site
+    $webAdmin = $false
+    try { Import-Module WebAdministration -ErrorAction Stop; $webAdmin = $true } catch {}
+
+    Write-Host ""
+    if (-not $webAdmin) {
+        Write-Host "  [ -- ] IIS checks skipped (WebAdministration module not available)" -ForegroundColor DarkGray
+    } else {
+        foreach ($s in @($cfg.Sites)) {
+            Write-Host ("  Site: {0}" -f $s.Name) -ForegroundColor White
+            VCheck "  Physical path exists" (Test-Path $s.Path) $s.Path
+            VCheck "  App pool exists     " (Test-Path "IIS:\AppPools\$($s.AppPool)") $s.AppPool
+            if ($s.PSObject.Properties['ExcludedFiles'] -and $s.ExcludedFiles) {
+                VInfo  "  Excluded files" ($s.ExcludedFiles -join ', ')
+            }
+            if ($s.PSObject.Properties['HealthUrl'] -and $s.HealthUrl) {
+                VInfo  "  Health check URL" $s.HealthUrl
+            }
+            Write-Host ""
+        }
+    }
+
+    Write-Host ("  " + ("-" * 58)) -ForegroundColor DarkGray
+    if ($allPassed) {
+        Write-Host "  All checks passed - config is ready to deploy." -ForegroundColor Green
+    } else {
+        Write-Host "  One or more checks failed - fix above before deploying." -ForegroundColor Red
+    }
+    Write-Host ""
+    exit $(if ($allPassed) { 0 } else { 1 })
+}
+
+# ---- subcommand: status ----------------------------------------------------
+
+if ($Action -eq 'status') {
+    $configsDir  = Join-Path $RootDir 'configs'
+    $historyFile = Join-Path $RootDir 'deploy-history.json'
+
+    $files = @()
+    if ($ProjectName) {
+        $f = Join-Path $configsDir "deploy-config-$ProjectName.json"
+        if (-not (Test-Path $f)) { throw "No config found for project: $ProjectName" }
+        $files = @(Get-Item $f)
+    } elseif (Test-Path $configsDir) {
+        $files = @(Get-ChildItem $configsDir -Filter 'deploy-config-*.json' | Sort-Object Name)
+    }
+
+    if ($files.Count -eq 0) {
+        Write-Host ""
+        Write-Host "  No projects configured." -ForegroundColor DarkGray
+        Write-Host ""
+        exit 0
+    }
+
+    $history = @()
+    if (Test-Path $historyFile) {
+        try { $history = @(Get-Content $historyFile -Raw | ConvertFrom-Json) } catch {}
+    }
+
+    $webAdmin = $false
+    try { Import-Module WebAdministration -ErrorAction Stop; $webAdmin = $true } catch {}
+
+    Write-Host ""
+    Write-Host ("  {0,-20} {1,-12} {2,-10} {3,-22} {4}" -f 'PROJECT', 'POOL', 'RESULT', 'LAST DEPLOY', 'BACKUPS') -ForegroundColor White
+    Write-Host ("  " + ("-" * 75)) -ForegroundColor DarkGray
+
+    foreach ($f in $files) {
+        $proj = $f.BaseName -replace '^deploy-config-', ''
+        $cfg  = $null
+        try { $cfg = Get-Content $f.FullName -Raw | ConvertFrom-Json } catch { continue }
+
+        # Pool state - collect unique states across all site pools
+        $poolStates = @()
+        foreach ($s in @($cfg.Sites)) {
+            if ($webAdmin -and $s.AppPool) {
+                try   { $poolStates += (Get-WebAppPoolState $s.AppPool -ErrorAction SilentlyContinue).Value }
+                catch { $poolStates += '?' }
+            } else { $poolStates += 'N/A' }
+        }
+        $poolStr   = ($poolStates | Sort-Object -Unique) -join '/'
+        $poolColor = switch -Wildcard ($poolStr) {
+            'Started' { 'Green' } 'Stopped' { 'Red' } default { 'Yellow' }
+        }
+
+        # Last deploy entry for this project
+        $last       = @($history | Where-Object { $_.Project -eq $proj }) |
+                      Sort-Object Timestamp -Descending |
+                      Select-Object -First 1
+        $deployStr  = if ($last) { $last.Timestamp } else { 'never' }
+        $resultStr  = if ($last) { $last.Result    } else { '-'      }
+        $resultColor = switch ($resultStr) { 'Success' { 'Green' } 'Failed' { 'Red' } default { 'DarkGray' } }
+
+        # Backup count + newest age
+        $backupStr = '-'
+        if ($cfg.BackupRoot -and (Test-Path $cfg.BackupRoot)) {
+            $bkps = @(Get-ChildItem $cfg.BackupRoot -Filter "${proj}_bkp_*.zip" -ErrorAction SilentlyContinue |
+                      Sort-Object LastWriteTime -Descending)
+            if ($bkps.Count -gt 0) {
+                $age    = (Get-Date) - $bkps[0].LastWriteTime
+                $ageStr = if    ($age.TotalMinutes -lt 60)  { "$([int]$age.TotalMinutes)m ago" }
+                          elseif ($age.TotalHours   -lt 24)  { "$([int]$age.TotalHours)h ago"   }
+                          else                               { "$([int]$age.TotalDays)d ago"     }
+                $backupStr = "$($bkps.Count) newest: $ageStr"
+            } else { $backupStr = '0' }
+        }
+
+        Write-Host ("  {0,-20} " -f $proj) -NoNewline
+        Write-Host ("{0,-12} " -f $poolStr)   -NoNewline -ForegroundColor $poolColor
+        Write-Host ("{0,-10} " -f $resultStr) -NoNewline -ForegroundColor $resultColor
+        Write-Host ("{0,-22} " -f $deployStr) -NoNewline
+        Write-Host $backupStr
+    }
+
+    Write-Host ""
     exit 0
 }
 
@@ -346,32 +551,50 @@ try {
 
     LogInfo "================ PREFLIGHT CHECKS ================"
 
-    Ensure (Test-Path $BackupRoot)     "BackupRoot not found: $BackupRoot"
-    Ensure (Test-Path $PublishZipPath) "Publish ZIP not found: $PublishZipPath"
+    Ensure (Test-Path $BackupRoot) "BackupRoot not found: $BackupRoot"
 
-    $zipFullPath = (Resolve-Path $PublishZipPath).Path
-    Ensure ($zipFullPath.ToLower().EndsWith(".zip")) "Publish artifact must be .zip"
-
-    foreach ($s in $Sites) {
-        Ensure (Test-Path $s.Path)                       "Site path not found: $($s.Path)"
-        Ensure (Test-Path "IIS:\AppPools\$($s.AppPool)") "AppPool not found: $($s.AppPool)"
+    # Resolve publish source: prefer the configured zip; fall back to a
+    # same-named folder (i.e. the zip was already extracted by the user).
+    $publishIsFolder = $false
+    if (Test-Path $PublishZipPath) {
+        $zipFullPath = (Resolve-Path $PublishZipPath).Path
+        Ensure ($zipFullPath.ToLower().EndsWith(".zip")) "Publish artifact must be .zip"
+    } else {
+        $folderPath = [System.IO.Path]::ChangeExtension($PublishZipPath, $null).TrimEnd('.')
+        if (Test-Path $folderPath -PathType Container) {
+            LogWarn "Publish ZIP not found - using pre-extracted folder: $folderPath"
+            $publishIsFolder = $true
+        } else {
+            throw "Publish source not found: neither '$PublishZipPath' nor '$folderPath' exists"
+        }
     }
 
-    # ZIP content pre-validation — check before touching anything live
-    LogInfo "Validating ZIP contents..."
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    $zip = [System.IO.Compression.ZipFile]::OpenRead($zipFullPath)
-    try {
-        $zipTopFolders = $zip.Entries |
-            ForEach-Object { $_.FullName -replace '\\','/' } |
-            Where-Object { $_ -match '^[^/]+/' } |
-            ForEach-Object { $_.Split('/')[0] } |
-            Sort-Object -Unique
+    foreach ($s in $Sites) {
+        Ensure (Test-Path $s.Path)                       "Site path not found: $($s.Path) — create the folder or re-run 'deploy --setup-config'"
+        Ensure (Test-Path "IIS:\AppPools\$($s.AppPool)") "AppPool not found: $($s.AppPool) — create the app pool or re-run 'deploy --setup-config'"
+    }
+
+    # Pre-validate publish source contents before touching anything live
+    LogInfo "Validating publish source contents..."
+    if ($publishIsFolder) {
         foreach ($s in $Sites) {
-            Ensure ($zipTopFolders -contains $s.Name) "ZIP is missing expected site folder: '$($s.Name)'"
+            Ensure (Test-Path (Join-Path $folderPath $s.Name)) "Publish folder is missing expected site folder: '$($s.Name)'"
         }
-    } finally {
-        $zip.Dispose()
+    } else {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($zipFullPath)
+        try {
+            $zipTopFolders = $zip.Entries |
+                ForEach-Object { $_.FullName -replace '\\','/' } |
+                Where-Object { $_ -match '^[^/]+/' } |
+                ForEach-Object { $_.Split('/')[0] } |
+                Sort-Object -Unique
+            foreach ($s in $Sites) {
+                Ensure ($zipTopFolders -contains $s.Name) "ZIP is missing expected site folder: '$($s.Name)'"
+            }
+        } finally {
+            $zip.Dispose()
+        }
     }
 
     LogOk "Preflight validation successful"
@@ -386,15 +609,21 @@ try {
 
     LogInfo "================ STAGING PACKAGE ================"
 
-    $staging = Join-Path $env:TEMP "deploy_staging_$Project"
-    if (Test-Path $staging) { Remove-Item $staging -Recurse -Force }
-
-    if (-not $DryRun) {
-        LogInfo "Extracting publish package..."
-        Expand-Archive $zipFullPath $staging
-        LogOk "Publish package extracted to: $staging"
+    $stagingIsTemp = -not $publishIsFolder
+    if ($publishIsFolder) {
+        $staging = (Resolve-Path $folderPath).Path
+        LogInfo "Using pre-extracted folder as staging: $staging"
     } else {
-        LogWarn "DRY-RUN: Would extract publish package"
+        $staging = Join-Path $env:TEMP "deploy_staging_$Project"
+        if (Test-Path $staging) { Remove-Item $staging -Recurse -Force }
+
+        if (-not $DryRun) {
+            LogInfo "Extracting publish package..."
+            Expand-Archive $zipFullPath $staging
+            LogOk "Publish package extracted to: $staging"
+        } else {
+            LogWarn "DRY-RUN: Would extract publish package"
+        }
     }
 
     # ------------------------------------------------
@@ -411,19 +640,32 @@ try {
 
     if (-not $DryRun -and -not $SkipBackup) {
 
-        LogInfo "Creating backup: $backupName"
-        New-Item $backupFolder -ItemType Directory -Force | Out-Null
-
-        foreach ($s in $Sites) {
-            LogInfo "Backing up $($s.Name)"
-            Copy-Item $s.Path (Join-Path $backupFolder $s.Name) -Recurse -Force
+        $sitesWithFiles = $Sites | Where-Object {
+            (Get-ChildItem $_.Path -Recurse -File -ErrorAction SilentlyContinue).Count -gt 0
         }
 
-        Compress-Archive $backupFolder $backupZip
-        Remove-Item $backupFolder -Recurse -Force
-        $backupCreated = $true
+        if ($sitesWithFiles.Count -eq 0) {
+            LogWarn "BACKUP SKIPPED: All site paths are empty - nothing to back up"
+        } else {
+            LogInfo "Creating backup: $backupName"
+            New-Item $backupFolder -ItemType Directory -Force | Out-Null
 
-        LogOk "Backup stored: $backupZip"
+            foreach ($s in $Sites) {
+                $fileCount = (Get-ChildItem $s.Path -Recurse -File -ErrorAction SilentlyContinue).Count
+                if ($fileCount -eq 0) {
+                    LogWarn "Skipping $($s.Name) - site path has no files"
+                } else {
+                    LogInfo "Backing up $($s.Name) ($fileCount files)"
+                    Copy-Item $s.Path (Join-Path $backupFolder $s.Name) -Recurse -Force
+                }
+            }
+
+            Compress-Archive $backupFolder $backupZip
+            Remove-Item $backupFolder -Recurse -Force
+            $backupCreated = $true
+
+            LogOk "Backup stored: $backupZip"
+        }
 
     } elseif ($DryRun) {
         LogWarn "DRY-RUN: Would create backup $backupName"
@@ -627,7 +869,7 @@ try {
         throw
     }
     finally {
-        if (Test-Path $staging) { Remove-Item $staging -Recurse -Force }
+        if ($stagingIsTemp -and (Test-Path $staging)) { Remove-Item $staging -Recurse -Force }
     }
 
 }
