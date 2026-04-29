@@ -6,7 +6,13 @@
       "Name": "TestApp",
       "Path": "D:\\Projects\\PublishIISCli\\tests\\TestApp",
       "AppPool": "TestAppPool",
-      "ExcludedFiles": [],
+      "ExcludedFiles": [
+        "appsettings.*.json",
+        "web.config",
+        ".env",
+        "*.pfx",
+        "*.key"
+      ],
       "HealthUrl": "http://localhost:8022/"
     }
   ]

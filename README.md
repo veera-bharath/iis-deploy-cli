@@ -117,7 +117,13 @@ PowerShell-native forms are also accepted: `-DryRun`, `-SkipBackup`, `-NoRestart
       "Name": "MyApp",
       "Path": "C:\\inetpub\\wwwroot\\MyApp",
       "AppPool": "MyAppPool",
-      "ExcludedFiles": ["appsettings.Development.json"],
+      "ExcludedFiles": [
+        "appsettings.*.json",
+        "web.config",
+        ".env",
+        "*.pfx",
+        "*.key"
+      ],
       "HealthUrl": "http://localhost/api/health"
     }
   ]
@@ -178,28 +184,6 @@ scripts/
 configs/                           # Per-project JSON configs (git-ignored)
 logs/                              # Transcript logs per deploy/rollback (git-ignored)
 deploy-history.json                # Append-only deploy log (git-ignored)
-```
-
-## Testing
-
-Tests use [Pester v5](https://pester.dev). Install it once (as Administrator):
-
-```powershell
-Install-Module Pester -Force -SkipPublisherCheck
-```
-
-Run tests (as Administrator  -  required by the deploy scripts):
-
-```powershell
-# All tests that do not require IIS
-.\scripts\tests\Run-Tests.ps1
-
-# Include integration tests (requires IIS installed + app pool named MySitePool)
-.\scripts\tests\Run-Tests.ps1 -Integration
-
-# One suite only
-.\scripts\tests\Run-Tests.ps1 -File deploy
-.\scripts\tests\Run-Tests.ps1 -File rollback
 ```
 
 ## License
